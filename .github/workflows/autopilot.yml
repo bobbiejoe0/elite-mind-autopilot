@@ -1,0 +1,147 @@
+# Generates one video from topics.txt and uploads it to YouTube.
+# One Short every day, plus a long-form (8-12 min) video on Mon/Wed/Fri.
+# Each scheduled run waits a random 0-3 hours first, so posting times differ
+# every day. See docs/autopilot.md.
+name: Autopilot
+
+on:
+  schedule:
+    # Times are UTC (West Africa Time = UTC+1).
+    - cron: "0 8 * * *"        # daily Short, 09:00-12:00 WAT
+    - cron: "0 12 * * 1,3,5"   # long video Mon/Wed/Fri, 13:00-16:00 WAT
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Upload to YouTube"
+        type: boolean
+        default: true
+      format:
+        description: "Video format"
+        type: choice
+        options: [short, long]
+        default: short
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autopilot
+  cancel-in-progress: false
+
+jobs:
+  video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      OLLAMA_MODEL: llama3.1:8b
+      OLLAMA_TIMEOUT: "1200"
+      IMAGEMAGICK_BINARY: /usr/bin/convert
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+      TIKTOK_SESSION_ID: ${{ secrets.TIKTOK_SESSION_ID }}
+      ASSEMBLY_AI_API_KEY: ${{ secrets.ASSEMBLY_AI_API_KEY }}
+      YOUTUBE_CATEGORY_ID: "27"
+      YOUTUBE_PRIVACY_STATUS: public
+      VIDEO_CALL_TO_ACTION: "Like, share and subscribe to Elite Mind Decoder for more!"
+      AUTOPILOT_NICHE: "money psychology, timeless wealth principles, economic laws, pricing and marketing tricks, behavioral finance, and the elite mindset"
+      AUTOPILOT_VOICE: "kokoro:am_onyx"
+      AUTOPILOT_PARAGRAPHS: "4"
+      VIDEO_MAX_WORDS: "270"
+      VISUAL_MODE: ai_images
+      TEXT_PROVIDER: pollinations
+      STORY_CHARACTER: "Black"
+      STORY_CHARACTER_LOOK: "a confident businessman in his late 40s with dark skin, short black hair with grey at the temples, a neat short beard, wearing a tailored black suit, black shirt and a gold wristwatch"
+      IMAGE_SCENE_SECONDS: "3.5"
+      # Local Stable Diffusion is too heavy for the runner; stock footage is the last fallback
+      IMAGE_PROVIDERS: "pollinations,cloudflare"
+      POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      AUTOPILOT_STOCK_VIDEOS: "12"
+      AUTOPILOT_LONG_PARAGRAPHS: "14"
+      AUTOPILOT_LONG_MAX_WORDS: "1600"
+      AUTOPILOT_LONG_SCENE_SECONDS: "9"
+      YOUTUBE_SYNTHETIC_MEDIA: "true"
+      YOUTUBE_DESCRIPTION_FOOTER: "Educational content only - not financial advice. Visuals and narration are AI-generated."
+      YOUTUBE_PLAYLIST: "Black's Money Lessons"
+
+    steps:
+      - name: Random delay (0-3 hours)
+        if: github.event_name == 'schedule'
+        run: |
+          delay=$((RANDOM % 10800))
+          echo "Sleeping ${delay}s before posting"
+          sleep "$delay"
+
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg imagemagick
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install Python dependencies
+        run: uv sync
+
+      - name: Cache Kokoro voice model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: kokoro-v1.0
+
+      - name: Cache Ollama model
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ env.OLLAMA_MODEL }}
+
+      - name: Start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          OLLAMA_MODELS="$HOME/.ollama/models" nohup ollama serve > ollama.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/tags && break; sleep 2; done
+          OLLAMA_MODELS="$HOME/.ollama/models" ollama pull "$OLLAMA_MODEL"
+
+      - name: Write YouTube credentials
+        env:
+          CLIENT_SECRET_JSON: ${{ secrets.YOUTUBE_CLIENT_SECRET_JSON }}
+          OAUTH_JSON: ${{ secrets.YOUTUBE_OAUTH_JSON }}
+        run: |
+          if [ -n "$CLIENT_SECRET_JSON" ] && [ -n "$OAUTH_JSON" ]; then
+            printf '%s' "$CLIENT_SECRET_JSON" > Backend/client_secret.json
+            printf '%s' "$OAUTH_JSON" > Backend/youtube-oauth2.json
+          else
+            echo "::warning::YouTube secrets missing, video will not be uploaded"
+          fi
+
+      - name: Generate and upload video
+        run: |
+          args=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [ "${{ inputs.upload }}" = "false" ] && args="$args --no-upload"
+            [ "${{ inputs.format }}" = "long" ] && args="$args --long"
+          elif [ "${{ github.event.schedule }}" = "0 12 * * 1,3,5" ]; then
+            args="--long"
+          fi
+          uv run python Backend/autopilot.py run $args
+
+      - name: Save video as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_number }}
+          path: output.mp4
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Commit topic progress
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add topics.txt topics_used.txt
+          git commit -m "autopilot: mark topic as used" || exit 0
+          git pull --rebase
+          git push

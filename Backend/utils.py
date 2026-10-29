@@ -121,12 +121,16 @@ def check_env_vars() -> None:
         SystemExit: If any required environment variables are missing.
     """
     try:
-        required_vars = ["PEXELS_API_KEY", "TIKTOK_SESSION_ID"]
+        required_vars = ["TIKTOK_SESSION_ID"]
         missing_vars = []
         for var in required_vars:
             value = os.getenv(var)
             if value is None or len(value) == 0:
                 missing_vars.append(var)
+
+        # Either stock video provider is enough
+        if not os.getenv("PEXELS_API_KEY") and not os.getenv("PIXABAY_API_KEY"):
+            missing_vars.append("PEXELS_API_KEY or PIXABAY_API_KEY")
 
         if missing_vars:
             missing_vars_str = ", ".join(missing_vars)

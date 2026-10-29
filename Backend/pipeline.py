@@ -1,6 +1,8 @@
 import os
+import re
 import shutil
 import subprocess
+import time
 
 from apiclient.errors import HttpError
 from moviepy import (
@@ -12,10 +14,19 @@ from moviepy import (
 )
 from uuid import uuid4
 
-from gpt import generate_metadata, generate_script, get_search_terms
+from gpt import (
+    generate_image_prompts,
+    generate_metadata,
+    generate_script,
+    get_search_terms,
+    unload_model,
+)
 from logstream import log
 from search import search_for_stock_videos
+from edgevoice import edge_tts_save
+from kokorovoice import kokoro_tts_save
 from tiktokvoice import tts
+from visuals import build_ai_video, group_scenes
 from utils import (
     BASE_DIR,
     PROJECT_ROOT,
@@ -24,8 +35,19 @@ from utils import (
     TEMP_DIR,
     choose_random_song,
 )
-from video import combine_videos, generate_subtitles, generate_video, save_video
-from youtube import upload_video
+from video import (
+    combine_videos,
+    generate_subtitles,
+    generate_thumbnail,
+    generate_video,
+    save_video,
+)
+from youtube import add_to_playlist, set_thumbnail, upload_video
+
+
+# Sentence boundary: . ! ? followed by whitespace, except after titles like
+# "Mr." so "Mr. Black" isn't split into two sentences
+SENTENCE_END = r"(?<=[.!?])(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bDr\.)\s+"
 
 
 class PipelineCancelled(Exception):
@@ -48,6 +70,11 @@ def run_generation_pipeline(
             raise PipelineCancelled("Video generation was cancelled.")
 
     paragraph_number = int(data.get("paragraphNumber", 1))
+    # "short": 1080x1920 YouTube Short; "long": 1920x1080 long-form video
+    video_format = data.get("format", "short")
+    frame_size = (1920, 1080) if video_format == "long" else (1080, 1920)
+    # Longer videos need more distinct clips so footage doesn't loop visibly
+    amount_of_stock_videos = int(data.get("stockVideos", amount_of_stock_videos))
     ai_model = data.get("aiModel")
     n_threads = data.get("threads")
     subtitles_position = data.get("subtitlesPosition")
@@ -76,6 +103,7 @@ def run_generation_pipeline(
         ai_model,
         voice,
         data["customPrompt"],
+        video_format=video_format,
     )
 
     if not script:
@@ -83,53 +111,95 @@ def run_generation_pipeline(
             "Could not generate a script. Try a different model or prompt."
         )
 
-    search_terms = get_search_terms(
-        data["videoSubject"], amount_of_stock_videos, script, ai_model
-    )
-
-    video_urls = []
-    it = 15
-    min_dur = 10
-
-    for search_term in search_terms:
-        guard_cancelled()
-        found_urls = search_for_stock_videos(
-            search_term, os.getenv("PEXELS_API_KEY"), it, min_dur
-        )
-        for url in found_urls:
-            if url not in video_urls:
-                video_urls.append(url)
+    # Hard length cap: TikTok voices speak ~3 words/second, so trim the script
+    # at a sentence boundary once it passes VIDEO_MAX_WORDS
+    max_words = int(data.get("maxWords") or os.getenv("VIDEO_MAX_WORDS", "0") or 0)
+    if max_words and len(script.split()) > max_words:
+        kept, count = [], 0
+        for sentence in re.split(SENTENCE_END, script.strip()):
+            words = len(sentence.split())
+            if kept and count + words > max_words:
                 break
+            kept.append(sentence)
+            count += words
+        emit(f"[*] Script trimmed from {len(script.split())} to {count} words.", "info")
+        script = " ".join(kept)
 
-    if not video_urls:
-        raise RuntimeError("No videos found to download.")
+    # Spoken outro appended to every video, e.g. "Like, share and subscribe!"
+    call_to_action = os.getenv("VIDEO_CALL_TO_ACTION", "").strip()
+    if call_to_action:
+        script = f"{script.rstrip().rstrip('.')}. {call_to_action}"
 
-    video_paths = []
-    emit(f"[+] Downloading {len(video_urls)} videos...", "info")
+    def fetch_stock_videos() -> list:
+        search_terms = get_search_terms(
+            data["videoSubject"], amount_of_stock_videos, script, ai_model
+        )
 
-    for video_url in video_urls:
-        guard_cancelled()
-        try:
-            saved_video_path = save_video(video_url)
-            video_paths.append(saved_video_path)
-        except Exception:
-            emit(f"[-] Could not download video: {video_url}", "error")
+        video_urls = []
+        it = 15
+        min_dur = 10
 
-    emit("[+] Videos downloaded!", "success")
+        for search_term in search_terms:
+            guard_cancelled()
+            found_urls = search_for_stock_videos(search_term, it, min_dur)
+            for url in found_urls:
+                if url not in video_urls:
+                    video_urls.append(url)
+                    break
+
+        if not video_urls:
+            raise RuntimeError("No videos found to download.")
+
+        video_paths = []
+        emit(f"[+] Downloading {len(video_urls)} videos...", "info")
+
+        for video_url in video_urls:
+            guard_cancelled()
+            try:
+                saved_video_path = save_video(video_url)
+                video_paths.append(saved_video_path)
+            except Exception:
+                emit(f"[-] Could not download video: {video_url}", "error")
+
+        emit("[+] Videos downloaded!", "success")
+        return video_paths
+
+    # "ai_images": AI-generated stills per scene; "stock": stock footage
+    visual_mode = os.getenv("VISUAL_MODE", "stock").strip().lower()
+    video_paths = fetch_stock_videos() if visual_mode != "ai_images" else []
+
     emit("[+] Script generated!", "success")
 
     guard_cancelled()
 
-    sentences = script.split(". ")
-    sentences = list(filter(lambda x: x != "", sentences))
+    # Split on sentence endings (. ! ?) and line breaks, keeping chunks short for TTS
+    sentences = [s.strip() for s in re.split(SENTENCE_END + r"|\n+", script)]
+    sentences = [s for s in sentences if s]
     paths = []
+    sentence_durations = []
 
     for sentence in sentences:
         guard_cancelled()
         current_tts_path = str(TEMP_DIR / f"{uuid4()}.mp3")
-        tts(sentence, voice, filename=current_tts_path)
+        # The TTS endpoints and network fail intermittently, so retry before giving up
+        for attempt in range(5):
+            try:
+                if voice.startswith("kokoro:"):
+                    kokoro_tts_save(sentence, voice.split(":", 1)[1], current_tts_path)
+                elif voice.endswith("Neural"):
+                    edge_tts_save(sentence, voice, current_tts_path)
+                else:
+                    tts(sentence, voice, filename=current_tts_path)
+            except Exception as err:
+                emit(f"[-] TTS attempt {attempt + 1} failed: {err}", "warning")
+            if os.path.exists(current_tts_path):
+                break
+            time.sleep(5 * (attempt + 1))
+        else:
+            raise RuntimeError(f"Text-to-speech failed for sentence: {sentence}")
         audio_clip = AudioFileClip(current_tts_path)
         paths.append(audio_clip)
+        sentence_durations.append(audio_clip.duration)
 
     final_audio = concatenate_audioclips(paths)
     tts_path = str(TEMP_DIR / f"{uuid4()}.mp3")
@@ -156,13 +226,38 @@ def run_generation_pipeline(
             "Could not generate subtitles. Check AssemblyAI key or local subtitle settings."
         )
 
-    temp_audio = AudioFileClip(tts_path)
-    try:
-        combined_video_path = combine_videos(
-            video_paths, temp_audio.duration, 5, n_threads or 2
+    combined_video_path = None
+    if visual_mode == "ai_images":
+        scenes = group_scenes(
+            sentences,
+            sentence_durations,
+            target=float(data.get("sceneSeconds") or os.getenv("IMAGE_SCENE_SECONDS", "5")),
         )
-    finally:
-        temp_audio.close()
+        emit(f"[+] Writing image prompts for {len(scenes)} scenes...", "info")
+        prompts = generate_image_prompts(
+            data["videoSubject"], [text for text, _ in scenes], ai_model
+        )
+        # Free the model's RAM before image generation and rendering
+        unload_model(ai_model)
+        try:
+            combined_video_path = build_ai_video(
+                scenes, prompts, on_log=emit, size=frame_size
+            )
+        except Exception as err:
+            emit(f"[-] AI images failed, falling back to stock footage: {err}", "warning")
+            video_paths = fetch_stock_videos()
+    else:
+        # Free the model's RAM before the memory-heavy rendering steps
+        unload_model(ai_model)
+
+    if not combined_video_path:
+        temp_audio = AudioFileClip(tts_path)
+        try:
+            combined_video_path = combine_videos(
+                video_paths, temp_audio.duration, 5, n_threads or 2, size=frame_size
+            )
+        finally:
+            temp_audio.close()
 
     try:
         final_video_path = generate_video(
@@ -172,6 +267,7 @@ def run_generation_pipeline(
             n_threads or 2,
             subtitles_position,
             text_color or "#FFFF00",
+            font_size=70 if video_format == "long" else 100,
         )
     except Exception as err:
         raise RuntimeError(
@@ -205,12 +301,14 @@ def run_generation_pipeline(
             )
 
         if not skip_yt_upload:
-            video_category_id = "28"
-            privacy_status = "private"
+            video_category_id = os.getenv("YOUTUBE_CATEGORY_ID", "28")
+            privacy_status = os.getenv("YOUTUBE_PRIVACY_STATUS", "private")
+            # e.g. "Educational content only, not financial advice."
+            footer = os.getenv("YOUTUBE_DESCRIPTION_FOOTER", "").strip()
             video_metadata = {
                 "video_path": str((TEMP_DIR / final_video_path).resolve()),
                 "title": title,
-                "description": description,
+                "description": f"{description}\n\n{footer}" if footer else description,
                 "category": video_category_id,
                 "keywords": ",".join(keywords),
                 "privacyStatus": privacy_status,
@@ -226,6 +324,30 @@ def run_generation_pipeline(
                     privacy_status=video_metadata["privacyStatus"],
                 )
                 emit(f"Uploaded video ID: {video_response.get('id')}", "success")
+
+                # Thumbnail failures shouldn't fail an already-uploaded video
+                try:
+                    thumbnail_path = generate_thumbnail(
+                        combined_video_path,
+                        title,
+                        size=(1280, 720) if video_format == "long" else (1080, 1920),
+                    )
+                    set_thumbnail(video_response.get("id"), thumbnail_path)
+                    emit("[+] Custom thumbnail set.", "success")
+                except Exception as thumb_err:
+                    emit(
+                        f"[-] Could not set thumbnail (is the channel phone-verified?): {thumb_err}",
+                        "warning",
+                    )
+
+                # Group uploads in a playlist so viewers binge (more watch time)
+                playlist_title = os.getenv("YOUTUBE_PLAYLIST", "").strip()
+                if playlist_title:
+                    try:
+                        add_to_playlist(video_response.get("id"), playlist_title)
+                        emit(f"[+] Added to playlist: {playlist_title}", "success")
+                    except Exception as playlist_err:
+                        emit(f"[-] Could not add to playlist: {playlist_err}", "warning")
             except HttpError as err:
                 emit(
                     f"An HTTP error {err.resp.status} occurred:\n{err.content}", "error"

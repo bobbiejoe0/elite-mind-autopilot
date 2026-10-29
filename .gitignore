@@ -18,3 +18,9 @@ main.py-oauth2.json
 Backend/output*
 Songs/
 venv/
+youtube-oauth2.json
+moneyprinter.db
+voice_samples/
+autopilot_state.json
+logs/
+models/

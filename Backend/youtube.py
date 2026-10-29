@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import random
 import httplib2
@@ -75,12 +74,14 @@ def get_authenticated_service():
         CLIENT_SECRETS_FILE, scope=SCOPES, message=MISSING_CLIENT_SECRETS_MESSAGE
     )
 
-    oauth_store = BASE_DIR / f"{Path(sys.argv[0]).name}-oauth2.json"
+    # Fixed name so the worker and `autopilot.py auth` share the same login
+    oauth_store = BASE_DIR / "youtube-oauth2.json"
     storage = Storage(str(oauth_store))
     credentials = storage.get()
 
     if credentials is None or credentials.invalid:
-        flags = argparser.parse_args()
+        # Avoid port 8080, which the MoneyPrinter API listens on
+        flags = argparser.parse_args(["--auth_host_port", "8090", "8091"])
         credentials = run_flow(flow, storage, flags)
 
     return build(
@@ -119,6 +120,10 @@ def initialize_upload(youtube: any, options: dict):
             "selfDeclaredMadeForKids": False,  # You declare that the video is not made for kids
         },
     }
+
+    # "Altered or synthetic content" disclosure, required for realistic AI visuals
+    if os.getenv("YOUTUBE_SYNTHETIC_MEDIA", "").strip().lower() in ("1", "true", "yes"):
+        body["status"]["containsSyntheticMedia"] = True
 
     # Call the API's videos.insert method to create and upload the video.
     insert_request = youtube.videos().insert(
@@ -215,3 +220,65 @@ def upload_video(video_path, title, description, category, keywords, privacy_sta
             return video_response
         else:
             raise e
+
+
+def set_thumbnail(video_id: str, thumbnail_path: str) -> None:
+    """
+    Sets a custom thumbnail on an uploaded video. The channel must be
+    phone-verified (YouTube Studio > Settings > Channel > Feature eligibility).
+
+    Args:
+        video_id (str): The uploaded video's ID.
+        thumbnail_path (str): Path to a JPEG/PNG under 2 MB.
+    """
+    youtube = get_authenticated_service()
+    youtube.thumbnails().set(
+        videoId=video_id,
+        media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
+    ).execute()
+
+
+def add_to_playlist(video_id: str, playlist_title: str) -> str:
+    """
+    Adds a video to the channel's playlist with this title, creating the
+    playlist (public) if it doesn't exist yet.
+
+    Args:
+        video_id (str): The uploaded video's ID.
+        playlist_title (str): Playlist title, e.g. "Black's Money Lessons".
+
+    Returns:
+        str: The playlist ID.
+    """
+    youtube = get_authenticated_service()
+
+    playlist_id = None
+    request = youtube.playlists().list(part="snippet", mine=True, maxResults=50)
+    while request and not playlist_id:
+        response = request.execute()
+        for item in response.get("items", []):
+            if item["snippet"]["title"].strip().lower() == playlist_title.strip().lower():
+                playlist_id = item["id"]
+                break
+        request = youtube.playlists().list_next(request, response)
+
+    if not playlist_id:
+        created = youtube.playlists().insert(
+            part="snippet,status",
+            body={
+                "snippet": {"title": playlist_title},
+                "status": {"privacyStatus": "public"},
+            },
+        ).execute()
+        playlist_id = created["id"]
+
+    youtube.playlistItems().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "playlistId": playlist_id,
+                "resourceId": {"kind": "youtube#video", "videoId": video_id},
+            }
+        },
+    ).execute()
+    return playlist_id

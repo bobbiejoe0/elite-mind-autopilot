@@ -1,0 +1,304 @@
+"""
+Autopilot: queue videos on a schedule without using the frontend.
+
+Usage:
+    python Backend/autopilot.py queue   # queue one video from the next unused topic
+    python Backend/autopilot.py queue --no-upload   # same, but never upload (for testing)
+    python Backend/autopilot.py run [--no-upload]   # generate + upload now, no worker needed
+    (add --long to queue/run for an 8-12 minute horizontal video)
+    python Backend/autopilot.py tick    # queue a post if one is due today (run every ~30 min)
+    python Backend/autopilot.py auth    # one-time YouTube login (opens a browser)
+
+Topics are read from topics.txt in the project root (one per line). Used topics
+are moved to topics_used.txt. When topics.txt runs out, new topics are
+generated with Ollama based on AUTOPILOT_NICHE.
+
+Run `queue` from Windows Task Scheduler (or cron) as often as you want to post.
+The worker must be running to actually generate the queued videos.
+"""
+
+import sys
+from pathlib import Path
+
+# pythonw.exe (used by the Windows scheduled tasks) has no console, so
+# sys.stdout/sys.stderr are None and any print crashes. Log to a file instead.
+if sys.stdout is None or sys.stderr is None:
+    _log_dir = Path(__file__).resolve().parent.parent / "logs"
+    _log_dir.mkdir(exist_ok=True)
+    _log_file = open(_log_dir / "autopilot.log", "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stdout or _log_file
+    sys.stderr = sys.stderr or _log_file
+
+import json
+import os
+import random
+import re
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+from dotenv import load_dotenv
+
+from utils import BASE_DIR, ENV_FILE, PROJECT_ROOT
+
+load_dotenv(ENV_FILE)
+
+from db import SessionLocal, init_db  # noqa: E402
+from gpt import generate_response  # noqa: E402
+from repository import create_job, get_job  # noqa: E402
+from models import GenerationJob  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+
+TOPICS_FILE = PROJECT_ROOT / "topics.txt"
+USED_TOPICS_FILE = PROJECT_ROOT / "topics_used.txt"
+STATE_FILE = PROJECT_ROOT / "autopilot_state.json"
+
+# Posting windows for `tick`: each day one random time is picked inside each
+# window (start .. start + AUTOPILOT_WINDOW_MINUTES).
+WINDOWS = [w.strip() for w in os.getenv("AUTOPILOT_WINDOWS", "07:00,12:00,17:00").split(",") if w.strip()]
+WINDOW_MINUTES = int(os.getenv("AUTOPILOT_WINDOW_MINUTES", "180"))
+# Long-form (8-12 min, horizontal) videos on these weekdays, inside their own window
+LONG_DAYS = [d.strip().lower()[:3] for d in os.getenv("AUTOPILOT_LONG_DAYS", "").split(",") if d.strip()]
+LONG_WINDOW = os.getenv("AUTOPILOT_LONG_WINDOW", "14:00")
+LONG_WINDOW_MINUTES = int(os.getenv("AUTOPILOT_LONG_WINDOW_MINUTES", "240"))
+MAX_ATTEMPTS_PER_SLOT = 2
+
+NICHE = os.getenv(
+    "AUTOPILOT_NICHE",
+    "mindset, discipline, self-improvement, stoicism and success habits",
+)
+NEW_TOPICS_BATCH = 10
+
+
+def _read_lines(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def _generate_topics(used: List[str]) -> List[str]:
+    recent = "\n".join(f"- {t}" for t in used[-50:])
+    prompt = (
+        f"Generate {NEW_TOPICS_BATCH} new, specific, catchy YouTube Shorts video topics "
+        f"for a channel about {NICHE}.\n"
+        "Each topic is a short title, for example: '5 habits of people with elite mindsets'.\n"
+        f"Do not repeat any of these already-used topics:\n{recent}\n\n"
+        "Return ONLY a JSON array of strings, nothing else."
+    )
+    response = generate_response(prompt, os.getenv("OLLAMA_MODEL", ""))
+
+    match = re.search(r"\[.*\]", response, re.DOTALL)
+    if not match:
+        raise RuntimeError(f"Could not parse topics from Ollama response: {response}")
+
+    used_lower = {t.lower() for t in used}
+    topics = [str(t).strip() for t in json.loads(match.group(0))]
+    return [t for t in topics if t and t.lower() not in used_lower]
+
+
+def peek_topic() -> str:
+    """Return the next topic without consuming it, generating more if needed."""
+    topics = _read_lines(TOPICS_FILE)
+
+    if not topics:
+        print("[*] topics.txt is empty, generating new topics with Ollama...")
+        topics = _generate_topics(_read_lines(USED_TOPICS_FILE))
+        if not topics:
+            raise RuntimeError("Ollama did not return any new topics.")
+        TOPICS_FILE.write_text("\n".join(topics) + "\n", encoding="utf-8")
+
+    return topics[0]
+
+
+def mark_topic_used(topic: str) -> None:
+    """Move a topic from topics.txt to topics_used.txt."""
+    remaining = [t for t in _read_lines(TOPICS_FILE) if t != topic]
+    TOPICS_FILE.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+    with USED_TOPICS_FILE.open("a", encoding="utf-8") as f:
+        f.write(topic + "\n")
+
+
+def next_topic() -> str:
+    topic = peek_topic()
+    mark_topic_used(topic)
+    return topic
+
+
+def build_payload(topic: str, upload: bool, video_format: str = "short") -> dict:
+    if video_format == "long":
+        return {
+            **build_payload(topic, upload),
+            "format": "long",
+            "paragraphNumber": int(os.getenv("AUTOPILOT_LONG_PARAGRAPHS", "14")),
+            "maxWords": int(os.getenv("AUTOPILOT_LONG_MAX_WORDS", "1600")),
+            "sceneSeconds": float(os.getenv("AUTOPILOT_LONG_SCENE_SECONDS", "6")),
+            "stockVideos": int(os.getenv("AUTOPILOT_LONG_STOCK_VIDEOS", "40")),
+            "subtitlesPosition": "center,bottom",
+        }
+    return {
+        "format": "short",
+        "videoSubject": topic,
+        "aiModel": os.getenv("OLLAMA_MODEL", ""),
+        # Comma-separated list: one voice is picked at random per video
+        "voice": random.choice(
+            [v.strip() for v in os.getenv("AUTOPILOT_VOICE", "en_us_006").split(",") if v.strip()]
+        ),
+        "paragraphNumber": int(os.getenv("AUTOPILOT_PARAGRAPHS", "3")),
+        "stockVideos": int(os.getenv("AUTOPILOT_STOCK_VIDEOS", "5")),
+        "subtitlesPosition": "center,center",
+        "color": "#FFFFFF",
+        "customPrompt": "",
+        "useMusic": True,
+        "automateYoutubeUpload": upload,
+    }
+
+
+def queue_video(
+    allow_upload: bool = True, topic: Optional[str] = None, video_format: str = "short"
+) -> str:
+    topic = topic or next_topic()
+    upload = allow_upload and (BASE_DIR / "client_secret.json").exists()
+
+    init_db()
+    with SessionLocal() as session:
+        job = create_job(session, payload=build_payload(topic, upload, video_format))
+
+    print(f"[+] Queued {video_format} job {job.id}: {topic}")
+    if not allow_upload:
+        print("[!] --no-upload set, video will NOT be uploaded.")
+    elif not upload:
+        print("[!] Backend/client_secret.json not found, video will NOT be uploaded.")
+    return job.id
+
+
+def _random_time(window: str, minutes: int) -> str:
+    start = datetime.strptime(window, "%H:%M")
+    return (start + timedelta(minutes=random.randint(0, minutes))).strftime("%H:%M")
+
+
+def _new_day_state(now: datetime) -> dict:
+    slots = [_random_time(w, WINDOW_MINUTES) for w in WINDOWS]
+    formats = ["short"] * len(slots)
+    if now.strftime("%a").lower() in LONG_DAYS:
+        slots.append(_random_time(LONG_WINDOW, LONG_WINDOW_MINUTES))
+        formats.append("long")
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "slots": slots,
+        "formats": formats,
+        "jobs": [None] * len(slots),
+        "attempts": [0] * len(slots),
+    }
+
+
+def tick() -> None:
+    """
+    Called every ~30 minutes while the PC is on. Picks random posting times
+    for each day and queues any post whose time has passed but hasn't been
+    made yet, one at a time, so missed posts are caught up after the PC was off.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
+    state = None
+    if STATE_FILE.exists():
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    if not state or state.get("date") != today:
+        state = _new_day_state(now)
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        print(f"[*] Posting times for {today}: {', '.join(state['slots'])}")
+
+    init_db()
+    with SessionLocal() as session:
+        busy = session.execute(
+            select(GenerationJob.id).where(GenerationJob.status.in_(["queued", "running"]))
+        ).first()
+    if busy:
+        print("[*] A video is already being made, checking again later.")
+        return
+
+    formats = state.get("formats") or ["short"] * len(state["slots"])
+    for i, slot in enumerate(state["slots"]):
+        if now.strftime("%H:%M") < slot:
+            continue
+        video_format = formats[i]
+
+        job_id = state["jobs"][i]
+        if job_id:
+            with SessionLocal() as session:
+                job = get_job(session, job_id)
+                status = job.status if job else "completed"
+                topic = job.payload.get("videoSubject") if job else None
+            if status != "failed" or state["attempts"][i] >= MAX_ATTEMPTS_PER_SLOT:
+                continue
+            print(f"[!] Post {i + 1} failed earlier, retrying: {topic}")
+            state["jobs"][i] = queue_video(topic=topic, video_format=video_format)
+        else:
+            print(f"[+] Post {i + 1} ({video_format}) was due at {slot}, queueing now.")
+            state["jobs"][i] = queue_video(video_format=video_format)
+
+        state["attempts"][i] += 1
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return
+
+    print("[*] Nothing due right now.")
+
+
+def run_video(allow_upload: bool = True, video_format: str = "short") -> None:
+    """
+    Generate (and upload) one video in this process, without the queue/worker.
+    The topic is only marked as used when the video succeeds, so a failed run
+    retries the same topic next time. Used by the GitHub Actions workflow.
+    """
+    from pipeline import run_generation_pipeline
+    from utils import SUBTITLES_DIR, TEMP_DIR, check_env_vars, clean_dir
+
+    check_env_vars()
+    clean_dir(str(TEMP_DIR))
+    clean_dir(str(SUBTITLES_DIR))
+
+    topic = peek_topic()
+    upload = allow_upload and (BASE_DIR / "client_secret.json").exists()
+    print(f"[+] Generating: {topic} (upload: {upload})")
+
+    uploaded = []
+
+    def on_log(message: str, level: str) -> None:
+        print(message, flush=True)
+        if message.startswith("Uploaded video ID:"):
+            uploaded.append(message)
+
+    run_generation_pipeline(
+        data=build_payload(topic, upload, video_format), is_cancelled=None, on_log=on_log
+    )
+
+    if upload and not uploaded:
+        raise RuntimeError("Video was generated but the YouTube upload failed.")
+
+    # Test runs don't consume the topic, so it still gets posted for real later
+    if allow_upload:
+        mark_topic_used(topic)
+    print(f"[+] Done: {topic}")
+
+
+def youtube_auth() -> None:
+    from youtube import get_authenticated_service
+
+    get_authenticated_service()
+    print("[+] YouTube login saved. Scheduled uploads can now run unattended.")
+
+
+if __name__ == "__main__":
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    video_format = "long" if "--long" in sys.argv[2:] else "short"
+    if command == "queue":
+        queue_video(allow_upload="--no-upload" not in sys.argv[2:], video_format=video_format)
+    elif command == "tick":
+        tick()
+    elif command == "run":
+        run_video(allow_upload="--no-upload" not in sys.argv[2:], video_format=video_format)
+    elif command == "auth":
+        youtube_auth()
+    else:
+        print(__doc__)
+        sys.exit(1)

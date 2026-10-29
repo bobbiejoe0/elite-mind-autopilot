@@ -1,3 +1,15 @@
+import sys
+from pathlib import Path
+
+# pythonw.exe (used by the Windows scheduled tasks) has no console, so
+# sys.stdout/sys.stderr are None and any print crashes. Log to a file instead.
+if sys.stdout is None or sys.stderr is None:
+    _log_dir = Path(__file__).resolve().parent.parent / "logs"
+    _log_dir.mkdir(exist_ok=True)
+    _log_file = open(_log_dir / "worker.log", "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stdout or _log_file
+    sys.stderr = sys.stderr or _log_file
+
 import time
 
 from dotenv import load_dotenv
